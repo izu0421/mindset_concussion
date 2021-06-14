@@ -1,0 +1,766 @@
+---
+title: "RPQ analysis - Mindset"
+author: "Yizhou Yu"
+date: "NA"
+output: 
+ html_document: 
+    toc: true
+    toc_float: true
+---
+
+The Rivermead Post-concussion Symptoms Questionnaire (RPQ) is a widely used tool for assessment of the presence and severity of various post-concussion symptoms. The questionnaire was first published in 1995 to assess patients' psychosocial functioning post-concussion. It contains 16 questions targeting physical, cognitive and behavioural domains. It was modified by Eyres et al. is 2005 into RPQ Modified Scoring System (RPQ 13/ RPQ-3)
+
+Workflow: 
+- Descriptive statistics
+- Do individuals with recent concussions score high on RPQ3 and whether anyone with less recent concussion symptoms?
+- Identify the main questions involved in the RPQ  (13 and 3)
+- See whether fewer questions in addition to the Mscores could predict the RPQ parameters. 
+
+## Data curation
+load libraries
+```{r, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(pdp)
+library(rpart.plot)
+library(caret)
+library(dplyr)
+```
+
+
+## Data curation
+load data<br>
+Note: in the metadt, when use == 2, the variables will have multiple components
+```{r}
+metadt = read.csv("metadt.csv")
+metadt = subset(metadt, use == 1)
+dt_raw = read.csv("dt/NK_14_04_2021.csv")
+dt <- dt_raw[, metadt$varname]
+```
+
+Add additional data: 
+
+Add RPQ questions: RPQ_Q1-16
+
+"RPQ_Q1_CORRECTED"                        "RPQ_Q2_CORRECTED"
+"RPQ_Q3_CORRECTED"                        "RPQ_Q4_CORRECTED"
+"RPQ_Q5_CORRECTED"                        "RPQ_Q6_CORRECTED"
+"RPQ_Q7_CORRECTED"                        "RPQ_Q8_CORRECTED"
+"RPQ_Q9_CORRECTED"                        "RPQ_Q10_CORRECTED"
+"RPQ_Q11_CORRECTED"                       "RPQ_Q12_CORRECTED"
+"RPQ_Q13_CORRECTED"                       "RPQ_Q14_CORRECTED"
+"RPQ_Q15_CORRECTED"                       "RPQ_Q16_CORRECTED"                      
+"RPQ_TOT_CORRECTED"                       "RPQ13_CORRECTED"  
+
+```{r}
+rpq_q_list = c()
+
+for (i in 1:16){
+  rpq_question = paste("RPQ_Q", i, "_CORRECTED", sep = "")
+  rpq_q_list = c(rpq_q_list, rpq_question)
+}
+rpq_dt = subset(read.csv("dt/NK_14_04_2021.csv"), select = rpq_q_list)
+head(rpq_dt,2)
+```
+
+```{r}
+subset(read.csv("metadt.csv"), use == 2)
+```
+
+```{r}
+dt_mci = dt_raw %>% select(starts_with("MCI_"))
+dt_neuro = dt_raw %>% select(starts_with("neuro_"))
+dt_RPQ = dt_raw %>% select(starts_with("RPQ"))
+dt_neuro$neuro_TOT = rowSums(dt_neuro)
+dt_MH = dt_raw %>% select(starts_with("MH_"))
+dt_MH$MH_TOT = rowSums(dt_MH)
+```
+
+```{r}
+#dt = cbind(dt,dt_mci) # use MCI_TOT instead
+dt$neuro_TOT = dt_neuro[,"neuro_TOT"]
+dt$MH_TOT = dt_MH[,"MH_TOT"]
+```
+
+exclude scores
+```{r}
+exclude_vars <- names(dt) %in% c("CAGE_TOT", #alcohol
+                                    "GAD7_TOT", #anxiety
+                                    "PHQ2_TOT", #depression
+                                    "PHQ9_TOT") #depression
+dt_noS = dt[,!exclude_vars]
+head(dt_noS)
+```
+## Descriptive data
+
+```{r}
+num_graph = dt_noS %>%
+  keep(is.numeric)
+discrete_graph = dt_noS[ , !(names(dt_noS) %in% colnames(num_graph))]
+
+discrete_graph_gather = discrete_graph %>%
+  gather() 
+
+ggplot(discrete_graph_gather, aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram(stat = "count",fill="#939598",color="#939598") +
+    theme(
+      text = element_text(colour = "#231F20"),
+      strip.background =element_rect(fill="transparent"),
+      axis.text.x = element_text(angle = 90,color = "#231F20"),
+      #axis.text.x = element_text(colour = "#231F20"),
+      axis.text.y = element_text(colour = "#231F20"),
+      panel.background = element_rect(fill = "transparent"), # bg of the panel
+      plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+      panel.grid.major = element_blank(), # get rid of major grid
+      panel.grid.minor = element_blank())# get rid of minor grid coord_flip()
+ggsave('fig/dt_distribution_discrete.pdf', width = 8, height = 10)
+```
+
+```{r}
+num_graph %>%
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram(fill="#939598",color="#939598") + 
+    theme(
+      text = element_text(colour = "#231F20"),
+      axis.text.x = element_text(colour = "#231F20"),
+      axis.text.y = element_text(colour = "#231F20"),
+      strip.background =element_rect(fill="transparent"),
+      panel.background = element_rect(fill = "transparent"), # bg of the panel
+      plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+      panel.grid.major = element_blank(), # get rid of major grid
+      panel.grid.minor = element_blank())# get rid of minor grid
+ggsave('fig/dt_distribution_continuous.pdf', width = 6.3, height = 7)
+```
+
+```{r}
+nrow(na.omit(dt_noS))
+```
+
+## Recent concussion and RPQ questions
+
+Reformat the data: I assume that Less than 1 year => recent, and more than 1 year => previous
+```{r}
+concussion_subanalysis = subset(dt_noS, select = c(age,mostRecentConcussion,
+                                                   RPQ3_CORRECTED,
+                                                   RPQ13_CORRECTED))
+concussion_subanalysis_dt = na.omit(concussion_subanalysis)
+concussion_subanalysis_dt$recent_concussion = with(concussion_subanalysis_dt, ifelse(mostRecentConcussion %in% 
+                                                 c("New_User_ConcussionC_1", 
+                                                   "New_User_ConcussionC_2"), TRUE, FALSE))
+```
+
+Scale: RPQ3 is out of 12, and RPQ13 is out of 52
+```{r}
+concussion_subanalysis_dt$norm_RPQ3 = concussion_subanalysis_dt$RPQ3_CORRECTED/12
+concussion_subanalysis_dt$norm_RPQ13 = concussion_subanalysis_dt$RPQ13_CORRECTED/52
+```
+
+```{r}
+summary(norm_RPQ3_lm <- lm(data = concussion_subanalysis_dt, norm_RPQ3 ~ recent_concussion + age))
+wilcox.test(concussion_subanalysis_dt$norm_RPQ3 ~ concussion_subanalysis_dt$recent_concussion)
+confint(norm_RPQ3_lm)
+```
+```{r}
+wilcox.test(concussion_subanalysis_dt$norm_RPQ13 ~ concussion_subanalysis_dt$recent_concussion)
+```
+```{r}
+prev_conc_lm = lm(data = concussion_subanalysis_dt, norm_RPQ13 ~ age + recent_concussion)
+summary(prev_conc_lm)
+```
+
+```{r}
+rec_conc_lm = lm(data = concussion_subanalysis_dt, norm_RPQ3 ~ age + recent_concussion)
+summary(rec_conc_lm)
+
+ggplot(data = concussion_subanalysis_dt, aes(x=recent_concussion, y=norm_RPQ3)) + 
+  geom_boxplot()+ theme_classic()+
+  theme(
+    panel.background = element_rect(fill = "transparent"), # bg of the panel
+    plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+    panel.grid.major = element_blank(), # get rid of major grid
+    panel.grid.minor = element_blank(), # get rid of minor grid
+    legend.background = element_rect(fill = "transparent"), # get rid of legend bg
+    legend.box.background = element_rect(fill = "transparent") # get rid of legend panel bg
+  )
+ggsave("fig/RPQ3_recent_concussion_validation.pdf", width = 2, height = 2,  bg = "transparent")
+```
+
+Conclusion: a recent concussion is associated with higher RPQ3 score (estimate = 0.1057319),
+but a previous concussion is not associated with a higher RPQ13 score, indicating that perhaps some people might be recovering well, while others are not. It might be interesting to explore this further.
+
+### Further analyses on RPQ3 
+
+I did not pursue further tests only on RPQ3 because there were only 22 individuals
+
+```{r}
+rpq3_analysis_subset = dt
+
+rpq3_analysis_subset$recent_concussion = with(rpq3_analysis_subset, ifelse(mostRecentConcussion %in% 
+                                                 c("New_User_ConcussionC_1", 
+                                                   "New_User_ConcussionC_2"), TRUE, FALSE))
+rpq3_analysis_subset = subset(rpq3_analysis_subset, recent_concussion == TRUE)
+nrow(rpq3_analysis_subset)
+
+# run a for loop to screen for all confounders one by one
+variable_list = colnames(rpq3_analysis_subset)
+variable_list = variable_list[variable_list != "age"]
+variable_list = variable_list[variable_list != "hadConcussion"]
+variable_list = variable_list[variable_list != "RPQ3_CORRECTED"]
+
+Estimate=c()
+Std..Error=c()
+t.value=c()
+Pr...t..=c()
+var_names=c()
+
+sumamry_list = data.frame(Estimate,Std..Error,t.value,Pr...t..,var_names)
+for (var in 1:length(variable_list)){
+  var_name = variable_list[var]
+  lm_formula = as.formula(
+    paste("RPQ3_CORRECTED",paste(c("age" , var_name), collapse = " + "),sep = " ~ ")
+  )
+  # print(lm_formula)
+  summary_var = summary(rpq3_subanalysis_lm <- lm(formula = lm_formula, data = rpq3_analysis_subset))
+  summary_df = data.frame(summary_var$coefficients)
+  summary_df$var_names = row.names(summary_df)
+  summary_df_clean = subset(summary_df, !(var_names %in% 
+                                            c('(Intercept)','age')))
+  sumamry_list = rbind(sumamry_list,summary_df_clean)
+}
+
+```
+
+```{r}
+sumamry_list_significant = subset(sumamry_list, Pr...t.. <= 0.05)
+sumamry_list_significant
+```
+
+Having a neurological condition seem to increase the RPQ score
+
+```{r}
+# summary(rpq3_subanalysis_lm_neuro <- lm(formula = (RPQ3_CORRECTED)/12 ~ 
+#                                     age + neuro_TOT, data = rpq3_analysis_subset))
+rpq3_analysis_subset_plot = rpq3_analysis_subset
+rpq3_analysis_subset_plot$neuro_condition = with(rpq3_analysis_subset_plot, ifelse(neuro_TOT >= 1, TRUE, FALSE))
+
+summary(rpq3_subanalysis_lm_neuro <- lm(formula = (RPQ3_CORRECTED)/12 ~ 
+                                    age + neuro_condition, data = rpq3_analysis_subset_plot))
+
+ggplot(data = rpq3_analysis_subset_plot, aes(x=neuro_condition, y=RPQ3_CORRECTED/12)) + 
+  geom_boxplot() + theme_classic()+
+  theme(
+    panel.background = element_rect(fill = "transparent"), # bg of the panel
+    plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+    panel.grid.major = element_blank(), # get rid of major grid
+    panel.grid.minor = element_blank(), # get rid of minor grid
+    legend.background = element_rect(fill = "transparent"), # get rid of legend bg
+    legend.box.background = element_rect(fill = "transparent") # get rid of legend panel bg
+  )
+ggsave("fig/RPQ3_subanalysis_neuro_condition.pdf", width = 2, height = 2,  bg = "transparent")
+```
+
+```{r}
+confint(rpq3_subanalysis_lm_neuro)
+length(rpq3_analysis_subset_plot$neuro_condition[rpq3_analysis_subset_plot$neuro_condition== TRUE])
+```
+
+8 have neurological condition and 22-8 = 14 do not. 
+
+## Simplification of RPQ3 
+
+```{r}
+rpq3_subanalysis = cbind(subset(dt_noS, select = c(RPQ3_CORRECTED)),rpq_dt[,1:3])
+```
+
+
+Do a PCA for RPQ3
+```{r}
+RPQ3_pca = FactoMineR::PCA(rpq3_subanalysis[,-1], scale.unit = TRUE, ncp = 5, graph = TRUE)
+```
+
+```{r}
+factoextra::fviz_pca_ind(RPQ3_pca,
+             geom.ind = "point", # show points only (nbut not "text")
+             ) + theme_classic()+
+  theme(
+    panel.background = element_rect(fill = "transparent"), # bg of the panel
+    plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+    panel.grid.major = element_blank(), # get rid of major grid
+    panel.grid.minor = element_blank(), # get rid of minor grid
+    legend.background = element_rect(fill = "transparent"), # get rid of legend bg
+    legend.box.background = element_rect(fill = "transparent") # get rid of legend panel bg
+  )
+ggsave("fig/RPQ3_PCA_general_graph.pdf", width = 3, height = 2,  bg = "transparent")
+```
+
+```{r}
+factoextra::fviz_eig(RPQ3_pca, addlabels = TRUE, ylim = c(0, 50)) + theme_classic()
+ggsave("fig/RPQ3_PCA_components.pdf", width = 3, height = 2,  bg = "transparent")
+```
+
+```{r}
+factoextra::fviz_contrib(RPQ3_pca, choice = "var", axes = 1, top = 100) + theme_classic()
+ggsave("fig/RPQ3_PCA_contribution.pdf", width = 3, height = 2,  bg = "transparent")
+```
+
+This shows that RPQ2 is the highest predictor of RPQ3. <br>Q2 is : Compared with before the accident, do you now (i.e., over the last 24 hours) suffer from Feelings of Dizziness
+
+Q1 is Headaches and Q3 is Nausea
+
+
+### RPQ - Q2 and RPQ3
+```{r}
+rpq3_validation = cbind(dt_noS,rpq_dt)
+rpq3_validation.lm = lm(data = rpq3_validation,RPQ3_CORRECTED~RPQ_Q2_CORRECTED + age)
+summary(rpq3_validation.lm)
+
+```
+
+```{r}
+# rpq3_validation.lm
+
+rpq3_validation.lm_dt = data.frame(cbind((cbind(Beta = coef(rpq3_validation.lm), 
+                                                confint(rpq3_validation.lm))), p_value = summary(rpq3_validation.lm)$coefficients[,4]))
+
+rpq3_validation.lm_dt$significance = "p-value > 0.05"
+rpq3_validation.lm_dt$significance[rpq3_validation.lm_dt$p_value < 0.05] <- "p-value < 0.05"
+rpq3_validation.lm_dt$name= row.names(rpq3_validation.lm_dt)
+rpq3_validation.lm_dt = subset(rpq3_validation.lm_dt, name != "(Intercept)")
+ggplot2::ggplot(rpq3_validation.lm_dt, 
+       aes(x=name, y=Beta, color = p_value, fill = p_value)) + 
+    geom_point(shape=21, size = 2.5) +
+    geom_errorbar(aes(ymin=X2.5.., ymax=X97.5..),
+                  width=0,                    # Width of the error bars
+                  size = 1.2,
+                  position=position_dodge(.9)) +
+  scale_color_gradient(
+  low = "#ED2024",
+  high = "#939598") + 
+  scale_fill_gradient(
+  low = "#ED2024",
+  high = "#939598") + 
+  theme_classic() + 
+  # geom_hline(yintercept = 1, linetype="dotted") +
+  coord_flip()+ylab("Beta") + 
+  xlab("") 
+ggsave("fig/rpq3_question2_lm.pdf", width = 4, height = 1.5,  bg = "transparent")
+```
+
+## Simplification of RPQ13 
+
+```{r}
+prev_conc_lm = lm(data = concussion_subanalysis_dt, norm_RPQ13 ~ age + recent_concussion)
+summary(prev_conc_lm)
+
+ggplot(data = concussion_subanalysis_dt, aes(x=recent_concussion, y=norm_RPQ13)) + 
+  geom_boxplot()+ theme_classic()+
+  theme(
+    panel.background = element_rect(fill = "transparent"), # bg of the panel
+    plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+    panel.grid.major = element_blank(), # get rid of major grid
+    panel.grid.minor = element_blank(), # get rid of minor grid
+    legend.background = element_rect(fill = "transparent"), # get rid of legend bg
+    legend.box.background = element_rect(fill = "transparent") # get rid of legend panel bg
+  )
+ggsave("fig/RPQ13_previous_concussion_validation.pdf", width = 2, height = 2,  bg = "transparent")
+```
+
+```{r}
+rpq13_subanalysis = cbind(subset(dt_noS, select = c(RPQ13_CORRECTED)),rpq_dt[,4:16])
+
+RPQ13_pca = FactoMineR::PCA(rpq13_subanalysis[,-1], scale.unit = TRUE, ncp = 5, graph = TRUE)
+```
+
+```{r}
+factoextra::fviz_pca_ind(RPQ13_pca,
+             geom.ind = "point", # show points only (nbut not "text")
+             ) + theme_classic()+
+  theme(
+    panel.background = element_rect(fill = "transparent"), # bg of the panel
+    plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+    panel.grid.major = element_blank(), # get rid of major grid
+    panel.grid.minor = element_blank(), # get rid of minor grid
+    legend.background = element_rect(fill = "transparent"), # get rid of legend bg
+    legend.box.background = element_rect(fill = "transparent") # get rid of legend panel bg
+  )
+ggsave("fig/RPQ13_PCA_general_graph.pdf", width = 3, height = 2,  bg = "transparent")
+```
+
+```{r}
+factoextra::fviz_eig(RPQ13_pca, addlabels = TRUE, ylim = c(0, 50))+ theme_classic()
+ggsave("fig/RPQ13_PCA.pdf", width = 3, height = 2,  bg = "transparent")
+```
+
+```{r}
+factoextra::fviz_contrib(RPQ13_pca, choice = "var", axes = 1, top = 100) + theme_classic() + 
+  theme(axis.text.x = element_text(angle = 90))
+ggsave("fig/RPQ3_PCA_contributions.pdf", width = 3, height = 4,  bg = "transparent")
+```
+
+This shows that RPQ2 is the highest predictor of RPQ3. <br>Q2 is : Compared with before the accident, do you now (i.e., over the last 24 hours) suffer from Feelings of Dizziness
+
+Q1 is Headaches and Q3 is Nausea
+
+
+### RPQ - Q9 and RPQ13
+```{r}
+rpq13_validation = cbind(dt_noS,rpq_dt)
+rpq13_validation.lm = lm(data = rpq3_validation,RPQ13_CORRECTED~RPQ_Q9_CORRECTED + 
+                           RPQ_Q12_CORRECTED + 
+                           RPQ_Q11_CORRECTED + 
+                           RPQ_Q6_CORRECTED +
+                           RPQ_Q10_CORRECTED +
+                           RPQ_Q7_CORRECTED +
+                           RPQ_Q16_CORRECTED +
+                           RPQ_Q8_CORRECTED)
+summary(rpq13_validation.lm)
+
+```
+
+```{r}
+rpq13_validation2 = cbind(dt_noS,rpq_dt)
+rpq13_validation2.lm = lm(data = rpq13_validation,RPQ13_CORRECTED~
+                           RPQ_Q9_CORRECTED)
+summary(rpq13_validation2.lm)
+
+```
+I tested whether adding any other variable will improve the scoring: RPQ Q6 improves the R2 from 0.65 to 0.82, which is the largest increase.
+
+RPQ Q6: Fatigue, tiring more easily
+RPQ Q9: Frustrated
+```{r}
+rpq13_validation.lm = lm(data = rpq3_validation,RPQ13_CORRECTED~RPQ_Q9_CORRECTED + 
+                           #RPQ_Q12_CORRECTED + 
+                           #RPQ_Q11_CORRECTED + 
+                           RPQ_Q6_CORRECTED #+
+                           #RPQ_Q10_CORRECTED +
+                           #RPQ_Q7_CORRECTED +
+                           #RPQ_Q16_CORRECTED +
+                           #RPQ_Q8_CORRECTED
+                         +age
+                         )
+summary(rpq13_validation.lm)
+
+```
+
+```{r}
+rpq13_validation.lm_df = data.frame(name=row.names(summary(rpq13_validation.lm)$coefficients),cbind((cbind(Beta = coef(rpq13_validation.lm), confint(rpq13_validation.lm))), p_value = summary(rpq13_validation.lm)$coefficients[,4]))
+
+write.csv(rpq13_validation.lm_df,"dt_out/rpq13_validation_lm.csv")
+
+rpq13_validation.lm_df = subset(rpq13_validation.lm_df, name != "(Intercept)")
+
+ggplot(rpq13_validation.lm_df, 
+       aes(x=reorder(name,Beta), y=Beta, color = p_value, fill = p_value)) + 
+    geom_point(shape=21, size = 2.5) +
+    geom_errorbar(aes(ymin=X2.5.., ymax=X97.5..),
+                  width=0,                    # Width of the error bars
+                  size = 1.2,
+                  position=position_dodge(.9)) +
+  scale_color_gradient(
+  low = "#ED2024",
+  high = "#939598") + 
+  scale_fill_gradient(
+  low = "#ED2024",
+  high = "#939598") + 
+  theme_classic() + 
+  # geom_hline(yintercept = 1, linetype="dotted") +
+  coord_flip()+ylab("Beta") + 
+  xlab("") + 
+  annotate("text", x = 2.5, y=1, label= "Adjusted R-squared:   0.82")
+
+ggsave('fig/rpq13_validation_lm.pdf', width = 4, height = 1.5,  bg = "transparent")
+```
+
+
+```{r}
+cor.test(rpq3_validation$RPQ_Q9_CORRECTED, rpq3_validation$RPQ_Q6_CORRECTED)
+rpq13_plot = na.omit(subset(rpq3_validation, select = c(RPQ_Q6_CORRECTED,RPQ_Q9_CORRECTED)))
+ggplot(data = rpq13_plot, aes(x = RPQ_Q6_CORRECTED, y = RPQ_Q9_CORRECTED)) + 
+  geom_point() +
+  geom_smooth(method = "lm") + 
+  theme_classic()
+```
+
+
+## Modifiable factors
+
+### Dementia
+```{r}
+dt_noS_dementia = subset(dt_noS, select = c(mostRecentConcussion,
+                                           RPQ13_CORRECTED,
+                                           # BM7 + 
+                                           age,
+                                           # ageStroopQscore + 
+                                           # concussions,
+                                           # covidPositive + 
+                                           dementia
+                                           # hadConcussion,
+                                           # joke + 
+                                           # memory + 
+                                           # alcohol,
+                                           # alcoholAmount,
+                                           # smoking,
+                                           # MCI_TOT
+                                           ))
+dt_noS_dementia = na.omit(dt_noS_dementia)
+dt_noS_dementia$recent_concussion = with(dt_noS_dementia, ifelse(mostRecentConcussion %in% 
+                                                 c("New_User_ConcussionC_1", 
+                                                   "New_User_ConcussionC_2"), TRUE, FALSE))
+dt_noS_dementia$dem_recoded = with(dt_noS_dementia, ifelse(dementia %in% 
+                                                 c("ResponseNo", 
+                                                   "ResponseDontKnow"), FALSE, TRUE))
+
+dt_long_concuss = subset(dt_noS_dementia, recent_concussion == FALSE)
+
+summary(rpq13_lm <-lm(data = dt_long_concuss, RPQ13_CORRECTED ~ 
+                                           # BM7 + 
+                                           age + 
+                                           # ageStroopQscore + 
+                                           # concussions,
+                                           # covidPositive + 
+                                           dementia# + 
+                                           # hadConcussion,
+                                           # joke + 
+                                           # memory + 
+                                           # alcohol * 
+                                           # alcoholAmount + 
+                                           # smoking + 
+                                           # MCI_TOT 
+                                           # neuro_TOT + 
+                                           # MH_TOT
+                                   ))
+
+rpq13_lm_dt = data.frame(cbind((cbind(Beta = coef(rpq13_lm), confint(rpq13_lm))), p_value = summary(rpq13_lm)$coefficients[,4]))
+
+write.csv(rpq13_lm_dt,"dt_out/rpq13_lm_dt_dementia.csv", row.names=TRUE)
+
+```
+
+
+### Smoking
+
+```{r}
+dt_noS_subset = subset(dt_noS, select = c(mostRecentConcussion,
+                                           RPQ13_CORRECTED,
+                                           # BM7 + 
+                                           age,
+                                           # ageStroopQscore + 
+                                           # concussions,
+                                           # covidPositive + 
+                                           # dementia
+                                           # hadConcussion,
+                                           # joke + 
+                                           # memory + 
+                                           # alcohol,
+                                           # alcoholAmount,
+                                           smoking
+                                           # MCI_TOT
+                                           ))
+
+dt_noS_subset$recent_concussion = with(dt_noS_subset, ifelse(mostRecentConcussion %in% 
+                                                 c("New_User_ConcussionC_1", 
+                                                   "New_User_ConcussionC_2"), TRUE, FALSE))
+
+dt_long_concuss = subset(dt_noS_subset, recent_concussion == FALSE)
+
+summary(rpq13_lm <-lm(data = dt_long_concuss, RPQ13_CORRECTED/52 ~ 
+                                           # BM7 + 
+                                           age + 
+                                           # ageStroopQscore + 
+                                           # concussions,
+                                           # covidPositive + 
+                                           # dementia# + 
+                                           # hadConcussion,
+                                           # joke + 
+                                           # memory + 
+                                           # alcohol * 
+                                           # alcoholAmount + 
+                                           smoking 
+                                           # MCI_TOT 
+                                           # neuro_TOT + 
+                                           # MH_TOT
+                                   ))
+
+rpq13_lm_dt = data.frame(cbind((cbind(Beta = coef(rpq13_lm), confint(rpq13_lm))), p_value = summary(rpq13_lm)$coefficients[,4]))
+
+write.csv(rpq13_lm_dt,"dt_out/rpq13_lm_dt_smoking.csv", row.names=TRUE)
+```
+
+### Alcohol
+
+```{r}
+dt_noS_subset = subset(dt_noS, select = c(mostRecentConcussion,
+                                           RPQ13_CORRECTED,
+                                           # BM7 + 
+                                           age,
+                                           # ageStroopQscore + 
+                                           # concussions,
+                                           # covidPositive + 
+                                           # dementia
+                                           # hadConcussion,
+                                           # joke + 
+                                           # memory + 
+                                           alcohol,
+                                           alcoholAmount
+                                           # smoking
+                                           # MCI_TOT
+                                           ))
+dt_noS_subset = na.omit(dt_noS_subset)
+dt_noS_subset$recent_concussion = with(dt_noS_subset, ifelse(mostRecentConcussion %in% 
+                                                 c("New_User_ConcussionC_1", 
+                                                   "New_User_ConcussionC_2"), TRUE, FALSE))
+
+dt_long_concuss = subset(dt_noS_subset, recent_concussion == FALSE)
+
+lvl.alcohol <- c("None","New_User_Alcohol_Amount_LT3","New_User_Alcohol_Amount_47","New_User_Alcohol_Amount_714","New_User_Alcohol_Amount_MT14")
+lbl.alcohol <- c(0,1,2,3,4)
+dt_long_concuss$alcohol_recoded <- ordered(dt_long_concuss$alcoholAmount, levels=lvl.alcohol, labels=lbl.alcohol)
+dt_long_concuss$alcohol_recoded = as.numeric(dt_long_concuss$alcohol_recoded)
+
+# dt_long_concuss$excessive_alcohol = with(dt_long_concuss, ifelse(alcoholAmount == "New_User_Alcohol_Amount_MT14", 
+#                                                    TRUE, FALSE))
+
+summary(rpq13_lm <-lm(data = dt_long_concuss, RPQ13_CORRECTED ~ 
+                                           # BM7 + 
+                                           age + 
+                                           # ageStroopQscore + 
+                                           # concussions,
+                                           # covidPositive + 
+                                           # dementia# + 
+                                           # hadConcussion,
+                                           # joke + 
+                                           # memory + 
+                                           # alcohol *
+                                           alcoholAmount #+
+                                           # smoking 
+                                           # MCI_TOT 
+                                           # neuro_TOT + 
+                                           # MH_TOT
+                      # alcohol_recoded
+                                   ))
+
+rpq13_lm_dt = data.frame(cbind((cbind(Beta = coef(rpq13_lm), confint(rpq13_lm))), p_value = summary(rpq13_lm)$coefficients[,4]))
+
+write.csv(rpq13_lm_dt,"dt_out/rpq13_lm_dt_alcohol.csv", row.names=TRUE)
+```
+
+
+### MCI
+
+```{r}
+dt_noS_subset = subset(dt_noS, select = c(mostRecentConcussion,
+                                           RPQ13_CORRECTED,
+                                           # BM7 + 
+                                           age,
+                                           # ageStroopQscore + 
+                                           # concussions,
+                                           # covidPositive + 
+                                           # dementia
+                                           # hadConcussion,
+                                           # joke + 
+                                           # memory + 
+                                           # alcohol,
+                                           # alcoholAmount
+                                           # smoking
+                                           MCI_TOT
+                                           ))
+
+dt_noS_subset$recent_concussion = with(dt_noS_subset, ifelse(mostRecentConcussion %in% 
+                                                 c("New_User_ConcussionC_1", 
+                                                   "New_User_ConcussionC_2"), TRUE, FALSE))
+
+dt_long_concuss = subset(dt_noS_subset, recent_concussion == FALSE)
+
+summary(rpq13_lm <-lm(data = dt_long_concuss, RPQ13_CORRECTED/52 ~ 
+                                           # BM7 + 
+                                           age + 
+                                           # ageStroopQscore + 
+                                           # concussions,
+                                           # covidPositive + 
+                                           # dementia# + 
+                                           # hadConcussion,
+                                           # joke + 
+                                           # memory + 
+                                           # alcohol * 
+                                           # alcoholAmount #+
+                                           # smoking 
+                                            MCI_TOT 
+                                           # neuro_TOT + 
+                                           # MH_TOT
+                                   ))
+
+rpq13_lm_dt = data.frame(cbind((cbind(Beta = coef(rpq13_lm), confint(rpq13_lm))), p_value = summary(rpq13_lm)$coefficients[,4]))
+
+write.csv(rpq13_lm_dt,"dt_out/rpq13_lm_dt_MCI.csv", row.names=TRUE)
+```
+
+### Plot
+
+Note: do not show dementia because it's hard to explain
+```{r}
+plot.mci = read.csv("dt_out/rpq13_lm_dt_MCI.csv")
+plot.alcohol = read.csv("dt_out/rpq13_lm_dt_alcohol.csv")
+plot.smoking = read.csv("dt_out/rpq13_lm_dt_smoking.csv")
+# plot.mci = read.csv("dt_out/rpq13_lm_dt_dementia.csv")
+plot.sum = rbind(plot.smoking,plot.mci)
+plot.sum = rbind(plot.sum,plot.alcohol)
+
+plot.sum$significance = "p-value > 0.05"
+plot.sum$significance[plot.sum$p_value < 0.05] <- "p-value < 0.05"
+
+plot.sum = subset(plot.sum, X != "(Intercept)")
+plot.sum = subset(plot.sum, X != "age")
+
+ggplot2::ggplot(plot.sum, 
+       aes(x=X, y=Beta/52, color = p_value, fill = p_value)) + 
+    geom_point(shape=21, size = 2.5) +
+    geom_errorbar(aes(ymin=X2.5../52, ymax=X97.5../52),
+                  width=0,                    # Width of the error bars
+                  size = 1.2,
+                  position=position_dodge(.9)) +
+  scale_color_gradient(
+  low = "#ED2024",
+  high = "#939598") + 
+  scale_fill_gradient(
+  low = "#ED2024",
+  high = "#939598") + 
+  theme_classic() + 
+  # geom_hline(yintercept = 1, linetype="dotted") +
+  coord_flip()+ylab("Beta") + 
+  xlab("") 
+ggsave("fig/long_concussion_rpq13_lm_MCI_smoking_alcohol.pdf", width = 7, height = 3,  bg = "transparent")
+```
+
+
+
+### Decision tree
+```{r eval = FALSE}
+tr1 <- trainControl(
+        method = 'LGOCV',
+        number = 1,
+        p = 0.75,
+        savePredictions = TRUE)
+m1 <- train(RPQ13_CORRECTED ~ .,
+        data = dt_noS_rpq_tot_na,
+        method = 'rpart2',
+        tuneLength = 10,
+        metric = 'MAE',
+        trControl = tr1)
+plot(m1)
+```
+
+```{r eval = FALSE}
+rpart.plot(m1$finalModel)
+```
+
+
+
+
+
+
+
+
